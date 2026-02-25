@@ -1,8 +1,17 @@
 ---
 name: memgine-context
 description: "Inject Memgine fact-based context into agent bootstrap"
-version: 0.1.0
 homepage: https://github.com/kkeeling/openclaw
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🧠",
+        "events": ["agent:bootstrap"],
+        "requires": { "config": ["workspace.dir"] },
+        "install": [{ "id": "bundled", "kind": "bundled", "label": "Bundled with OpenClaw" }],
+      },
+  }
 ---
 
 # memgine-context
@@ -35,9 +44,9 @@ hooks:
 
 1. On `agent:bootstrap`, the hook:
    - Gets the current agent ID and session type from the event context
-   - Generates an embedding for recent conversation context (or uses a default query)
+   - Generates an embedding for recent conversation context
    - Calls the Memgine `engine:assembleContext` action via Convex HTTP
-   - Injects the assembled context as a virtual bootstrap file named `MEMGINE_CONTEXT.md`
+   - Injects the assembled context as a virtual bootstrap file
 2. Engine-level filtering ensures:
    - Agent-private facts are only visible to the authoring agent
    - Hypothetical/draft facts are excluded
