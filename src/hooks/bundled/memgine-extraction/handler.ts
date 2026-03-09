@@ -133,11 +133,10 @@ async function triggerExtraction(params: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      turnContent: params.turnContent,
+      content: params.turnContent,
       agentId: params.agentId,
       sessionKey: params.sessionKey,
       turnIndex: params.turnIndex,
-      sourceType: params.sourceType,
       model: params.model,
       apiKey: params.apiKey,
       openaiApiKey: params.openaiApiKey,

@@ -14,12 +14,22 @@ http.route({
   method: "POST",
   handler: httpAction(async (ctx, request) => {
     const body = await request.json();
-    const { agentId, sessionKey, turnIndex, content, model } = body as {
+    const {
+      agentId,
+      sessionKey,
+      turnIndex,
+      content,
+      model,
+      apiKey: bodyApiKey,
+      openaiApiKey: bodyOpenaiKey,
+    } = body as {
       agentId: string;
       sessionKey: string;
       turnIndex: number;
       content: string;
       model: string;
+      apiKey?: string;
+      openaiApiKey?: string;
     };
 
     if (!agentId || !content) {
@@ -29,8 +39,8 @@ http.route({
       });
     }
 
-    // Use OpenRouter or Anthropic for extraction
-    const apiKey = process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY;
+    // Use OpenRouter or Anthropic for extraction (request body keys take precedence)
+    const apiKey = bodyApiKey || process.env.OPENROUTER_API_KEY || process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
       return new Response(JSON.stringify({ error: "No API key configured" }), {
         status: 500,
@@ -54,7 +64,7 @@ Turn content:
 ${content.slice(0, 4000)}`;
 
     try {
-      const isOpenRouter = !!process.env.OPENROUTER_API_KEY;
+      const isOpenRouter = !!bodyApiKey || !!process.env.OPENROUTER_API_KEY;
       const llmUrl = isOpenRouter
         ? "https://openrouter.ai/api/v1/chat/completions"
         : "https://api.anthropic.com/v1/messages";
@@ -132,8 +142,8 @@ ${content.slice(0, 4000)}`;
         });
       }
 
-      // Generate embeddings for facts
-      const openaiKey = process.env.OPENAI_API_KEY;
+      // Generate embeddings for facts (request body key takes precedence)
+      const openaiKey = bodyOpenaiKey || process.env.OPENAI_API_KEY;
 
       // Insert facts
       const factEntries = facts.map((f) => ({

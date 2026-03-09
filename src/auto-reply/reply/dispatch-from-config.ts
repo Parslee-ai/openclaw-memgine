@@ -1,12 +1,17 @@
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import type { FinalizedMsgContext } from "../templating.js";
+import type { GetReplyOptions, ReplyPayload } from "../types.js";
+import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
+import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { loadSessionStore, resolveStorePath, type SessionEntry } from "../../config/sessions.js";
 import { logVerbose } from "../../globals.js";
 import { fireAndForgetHook } from "../../hooks/fire-and-forget.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import {
+  buildCanonicalSentMessageHookContext,
   deriveInboundMessageHookContext,
   toInternalMessageReceivedContext,
+  toInternalMessageSentContext,
   toPluginMessageContext,
   toPluginMessageReceivedEvent,
 } from "../../hooks/message-hook-mappers.js";
@@ -21,12 +26,9 @@ import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { maybeApplyTtsToPayload, normalizeTtsAutoMode, resolveTtsConfig } from "../../tts/tts.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
 import { getReplyFromConfig } from "../reply.js";
-import type { FinalizedMsgContext } from "../templating.js";
-import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { formatAbortReplyText, tryFastAbortFromMessage } from "./abort.js";
 import { shouldBypassAcpDispatchForCommand, tryDispatchAcpReply } from "./dispatch-acp.js";
 import { shouldSkipDuplicateInbound } from "./inbound-dedupe.js";
-import type { ReplyDispatcher, ReplyDispatchKind } from "./reply-dispatcher.js";
 import { shouldSuppressReasoningPayload } from "./reply-payloads.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
 import { resolveRunTypingPolicy } from "./typing-policy.js";
@@ -534,6 +536,39 @@ export async function dispatchReplyFromConfig(params: {
       } catch (err) {
         logVerbose(
           `dispatch-from-config: accumulated block TTS failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Emit message:sent for inline (non-routed) delivery path.
+    // Routed replies already emit message:sent via deliverOutboundPayloads.
+    if (sessionKey && !shouldRouteToOriginating) {
+      const sentContent =
+        replies
+          .map((r) => r.text ?? "")
+          .filter(Boolean)
+          .join("\n") || accumulatedBlockText;
+      if (sentContent.trim()) {
+        const sentCanonical = buildCanonicalSentMessageHookContext({
+          to: chatId ?? "",
+          content: sentContent,
+          success: true,
+          channelId: channel,
+          accountId: ctx.AccountId,
+          conversationId: chatId,
+          isGroup,
+          groupId,
+        });
+        fireAndForgetHook(
+          triggerInternalHook(
+            createInternalHookEvent(
+              "message",
+              "sent",
+              sessionKey,
+              toInternalMessageSentContext(sentCanonical),
+            ),
+          ),
+          "dispatch-from-config: message:sent internal hook failed",
         );
       }
     }
