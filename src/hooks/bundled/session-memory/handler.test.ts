@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
-import { writeWorkspaceFile } from "../../../test-helpers/workspace.js";
 import type { HookHandler } from "../../hooks.js";
+import { writeWorkspaceFile } from "../../../test-helpers/workspace.js";
 import { createHookEvent } from "../../hooks.js";
 
 // Avoid calling the embedded Pi agent (global command lane); keep this unit test deterministic.
@@ -78,7 +78,12 @@ async function runNewWithPreviousSessionEntry(params: {
   await handler(event);
 
   const memoryDir = path.join(params.tempDir, "memory");
-  const files = await fs.readdir(memoryDir);
+  let files: string[] = [];
+  try {
+    files = await fs.readdir(memoryDir);
+  } catch {
+    // memory dir may not exist if memgine forwarding succeeded without markdown fallback
+  }
   const memoryContent =
     files.length > 0 ? await fs.readFile(path.join(memoryDir, files[0]), "utf-8") : "";
   return { files, memoryContent };
@@ -181,6 +186,30 @@ function expectMemoryConversation(params: {
 }
 
 describe("session-memory hook", () => {
+  it("skips sessions with content shorter than 20 chars", async () => {
+    const sessionContent = createMockSessionContent([{ role: "user", content: "hi" }]);
+    const tempDir = await createCaseWorkspace("workspace");
+    const sessionsDir = path.join(tempDir, "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+
+    const sessionFile = await writeWorkspaceFile({
+      dir: sessionsDir,
+      name: "test-session.jsonl",
+      content: sessionContent,
+    });
+
+    const event = createHookEvent("command", "new", "agent:main:main", {
+      cfg: { agents: { defaults: { workspace: tempDir } } } satisfies OpenClawConfig,
+      previousSessionEntry: { sessionId: "test-123", sessionFile },
+    });
+
+    await handler(event);
+
+    // No memory directory created for very short sessions
+    const memoryDir = path.join(tempDir, "memory");
+    await expect(fs.access(memoryDir)).rejects.toThrow();
+  });
+
   it("skips non-command events", async () => {
     const tempDir = await createCaseWorkspace("workspace");
 
@@ -509,9 +538,9 @@ describe("session-memory hook", () => {
   });
 
   it("handles empty session files gracefully", async () => {
-    // Should not throw
+    // Should not throw — empty content is skipped (too short for extraction)
     const { files } = await runNewWithPreviousSession({ sessionContent: "" });
-    expect(files.length).toBe(1);
+    expect(files.length).toBe(0);
   });
 
   it("handles session files with fewer messages than requested", async () => {
@@ -525,5 +554,194 @@ describe("session-memory hook", () => {
     // Both messages should be included
     expect(memoryContent).toContain("user: Only message 1");
     expect(memoryContent).toContain("assistant: Only message 2");
+  });
+
+  it("falls back to markdown when memgine env vars are not set", async () => {
+    // Without MEMGINE_CONVEX_SITE_URL, OPENROUTER_API_KEY, OPENAI_API_KEY
+    // the hook should still write markdown (graceful degradation)
+    const sessionContent = createMockSessionContent([
+      { role: "user", content: "Testing fallback to markdown when memgine unavailable" },
+      { role: "assistant", content: "This should still be saved as markdown" },
+    ]);
+    const { files, memoryContent } = await runNewWithPreviousSession({ sessionContent });
+
+    expect(files.length).toBe(1);
+    expect(memoryContent).toContain("user: Testing fallback to markdown when memgine unavailable");
+  });
+
+  it("writes markdown when archiveToMarkdown is true", async () => {
+    const sessionContent = createMockSessionContent([
+      { role: "user", content: "Archive mode should always produce markdown files" },
+      { role: "assistant", content: "Yes it should, regardless of memgine status" },
+    ]);
+    const { files, memoryContent } = await runNewWithPreviousSession({
+      sessionContent,
+      cfg: (tempDir) => ({
+        agents: { defaults: { workspace: tempDir } },
+        hooks: {
+          internal: {
+            entries: {
+              "session-memory": { enabled: true, archiveToMarkdown: true },
+            },
+          },
+        },
+      }),
+    });
+
+    expect(files.length).toBe(1);
+    expect(memoryContent).toContain("user: Archive mode should always produce markdown files");
+  });
+
+  it("forwards to memgine when env vars are set", async () => {
+    // Mock fetch to simulate memgine endpoint
+    const originalFetch = globalThis.fetch;
+    const fetchCalls: Array<{ url: string; body: string }> = [];
+    globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      if (urlStr.includes("/api/extract")) {
+        fetchCalls.push({ url: urlStr, body: init?.body as string });
+        return new Response(JSON.stringify({ factsExtracted: 2 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return originalFetch(url, init);
+    }) as unknown as typeof fetch;
+
+    // Set env vars for memgine
+    const prevSiteUrl = process.env.MEMGINE_CONVEX_SITE_URL;
+    const prevOrKey = process.env.OPENROUTER_API_KEY;
+    const prevOaiKey = process.env.OPENAI_API_KEY;
+    process.env.MEMGINE_CONVEX_SITE_URL = "https://test.convex.site";
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    process.env.OPENAI_API_KEY = "test-oai-key";
+
+    try {
+      const sessionContent = createMockSessionContent([
+        { role: "user", content: "This should be forwarded to memgine extraction" },
+        { role: "assistant", content: "And stored as structured facts" },
+      ]);
+      const { files } = await runNewWithPreviousSession({ sessionContent });
+
+      // Memgine forwarding happened
+      expect(fetchCalls.length).toBe(1);
+      expect(fetchCalls[0].url).toBe("https://test.convex.site/api/extract");
+      const body = JSON.parse(fetchCalls[0].body);
+      expect(body.agentId).toBe("main");
+      expect(body.content).toContain("session-boundary");
+      expect(body.turnIndex).toBe(-1);
+
+      // No markdown written when memgine succeeds
+      expect(files.length).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.MEMGINE_CONVEX_SITE_URL = prevSiteUrl;
+      process.env.OPENROUTER_API_KEY = prevOrKey;
+      process.env.OPENAI_API_KEY = prevOaiKey;
+    }
+  });
+
+  it("falls back to markdown when memgine POST fails", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+      if (urlStr.includes("/api/extract")) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+      return originalFetch(url, init);
+    }) as unknown as typeof fetch;
+
+    const prevSiteUrl = process.env.MEMGINE_CONVEX_SITE_URL;
+    const prevOrKey = process.env.OPENROUTER_API_KEY;
+    const prevOaiKey = process.env.OPENAI_API_KEY;
+    process.env.MEMGINE_CONVEX_SITE_URL = "https://test.convex.site";
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    process.env.OPENAI_API_KEY = "test-oai-key";
+
+    try {
+      const sessionContent = createMockSessionContent([
+        { role: "user", content: "Memgine is down but we should still save to markdown" },
+        { role: "assistant", content: "Fallback safety net activated" },
+      ]);
+      const { files, memoryContent } = await runNewWithPreviousSession({ sessionContent });
+
+      // Markdown written as fallback
+      expect(files.length).toBe(1);
+      expect(memoryContent).toContain("user: Memgine is down but we should still save to markdown");
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.MEMGINE_CONVEX_SITE_URL = prevSiteUrl;
+      process.env.OPENROUTER_API_KEY = prevOrKey;
+      process.env.OPENAI_API_KEY = prevOaiKey;
+    }
+  });
+
+  it("falls back to markdown when fetch throws (network error)", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+
+    const prevSiteUrl = process.env.MEMGINE_CONVEX_SITE_URL;
+    const prevOrKey = process.env.OPENROUTER_API_KEY;
+    const prevOaiKey = process.env.OPENAI_API_KEY;
+    process.env.MEMGINE_CONVEX_SITE_URL = "https://test.convex.site";
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    process.env.OPENAI_API_KEY = "test-oai-key";
+
+    try {
+      const sessionContent = createMockSessionContent([
+        { role: "user", content: "Network error should trigger markdown fallback" },
+        { role: "assistant", content: "Safety net catches thrown errors too" },
+      ]);
+      const { files, memoryContent } = await runNewWithPreviousSession({ sessionContent });
+
+      // Markdown written as fallback even on network error
+      expect(files.length).toBe(1);
+      expect(memoryContent).toContain("user: Network error should trigger markdown fallback");
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.MEMGINE_CONVEX_SITE_URL = prevSiteUrl;
+      process.env.OPENROUTER_API_KEY = prevOrKey;
+      process.env.OPENAI_API_KEY = prevOaiKey;
+    }
+  });
+
+  it("writes same content to markdown fallback as was sent to memgine", async () => {
+    const originalFetch = globalThis.fetch;
+    let sentContent = "";
+    globalThis.fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      // Capture content sent to memgine, then fail so we fall back to markdown
+      const body = JSON.parse(init?.body as string);
+      sentContent = body.content;
+      return new Response("Intentional failure", { status: 500 });
+    }) as unknown as typeof fetch;
+
+    const prevSiteUrl = process.env.MEMGINE_CONVEX_SITE_URL;
+    const prevOrKey = process.env.OPENROUTER_API_KEY;
+    const prevOaiKey = process.env.OPENAI_API_KEY;
+    process.env.MEMGINE_CONVEX_SITE_URL = "https://test.convex.site";
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+    process.env.OPENAI_API_KEY = "test-oai-key";
+
+    try {
+      const sessionContent = createMockSessionContent([
+        { role: "user", content: "Content parity between memgine and markdown" },
+        { role: "assistant", content: "Both paths should preserve the same conversation" },
+      ]);
+      const { memoryContent } = await runNewWithPreviousSession({ sessionContent });
+
+      // The conversation text sent to memgine should also appear in the markdown fallback
+      expect(sentContent).toContain("Content parity between memgine and markdown");
+      expect(memoryContent).toContain("user: Content parity between memgine and markdown");
+      expect(memoryContent).toContain(
+        "assistant: Both paths should preserve the same conversation",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.MEMGINE_CONVEX_SITE_URL = prevSiteUrl;
+      process.env.OPENROUTER_API_KEY = prevOrKey;
+      process.env.OPENAI_API_KEY = prevOaiKey;
+    }
   });
 });

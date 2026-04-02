@@ -70,7 +70,7 @@ const memgineExtractionHook: InternalHookHandler = async (event) => {
   // Resolve config
   // The event context might not have cfg directly, so we check the global config via env
   const convexSiteUrl =
-    process.env.MEMGINE_CONVEX_SITE_URL || "https://necessary-gecko-572.convex.site";
+    process.env.MEMGINE_CONVEX_SITE_URL || "https://grand-coyote-108.convex.site";
   const openrouterApiKey = process.env.OPENROUTER_API_KEY;
   const openaiApiKey = process.env.OPENAI_API_KEY;
   const extractionModel = process.env.MEMGINE_EXTRACTION_MODEL || "anthropic/claude-haiku-4-5";

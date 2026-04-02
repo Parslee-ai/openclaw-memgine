@@ -213,6 +213,83 @@ ${content.slice(0, 4000)}`;
 });
 
 /**
+ * POST /api/seed
+ * Batch insert facts directly (no LLM extraction). Used by the memgine-seed
+ * migration script to import historical memory from SQLite databases.
+ */
+http.route({
+  path: "/api/seed",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const body = await request.json();
+    const { facts } = body as {
+      facts: Array<{
+        factId: string;
+        factText: string;
+        layer: number;
+        scope: "global" | "task" | "hypothetical" | "draft";
+        visibility: "team" | "agent-private";
+        authorAgent: string;
+        sourceType: "conversation" | "policy" | "system" | "cross-agent";
+        authority: "user" | "agent" | "policy" | "system";
+        sessionKey?: string;
+      }>;
+    };
+
+    if (!facts || !Array.isArray(facts) || facts.length === 0) {
+      return new Response(JSON.stringify({ error: "Missing or empty facts array" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    try {
+      const ids = await ctx.runMutation(api.facts.createBatch, { facts });
+      return new Response(JSON.stringify({ inserted: ids.length }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: String(err) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }),
+});
+
+/**
+ * POST /api/seed-embedding
+ * Store an embedding for a fact. Used by the memgine-seed migration script.
+ */
+http.route({
+  path: "/api/seed-embedding",
+  method: "POST",
+  handler: httpAction(async (ctx, request) => {
+    const body = await request.json();
+    const { factId, embedding } = body as { factId: string; embedding: number[] };
+
+    if (!factId || !embedding) {
+      return new Response(JSON.stringify({ error: "Missing factId or embedding" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    try {
+      await ctx.runMutation(api.embeddings.store, { factId, embedding });
+      return new Response(JSON.stringify({ stored: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: String(err) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }),
+});
+
+/**
  * POST /api/action
  * Generic action dispatcher — used by the context hook to call assembleContext.
  */

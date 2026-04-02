@@ -1,22 +1,23 @@
 /**
  * Session memory hook handler
  *
- * Saves session context to memory when /new or /reset command is triggered
- * Creates a new dated memory file with LLM-generated slug
+ * On /new or /reset: extracts recent conversation, forwards to memgine
+ * extraction endpoint for structured fact storage. Falls back to writing
+ * markdown files when memgine is unreachable.
  */
 
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { resolveAgentWorkspaceDir } from "../../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../../config/config.js";
+import type { HookHandler } from "../../hooks.js";
+import { resolveAgentWorkspaceDir } from "../../../agents/agent-scope.js";
 import { resolveStateDir } from "../../../config/paths.js";
 import { writeFileWithinRoot } from "../../../infra/fs-safe.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { resolveAgentIdFromSessionKey } from "../../../routing/session-key.js";
 import { hasInterSessionUserProvenance } from "../../../sessions/input-provenance.js";
 import { resolveHookConfig } from "../../config.js";
-import type { HookHandler } from "../../hooks.js";
 import { generateSlugViaLLM } from "../../llm-slug-generator.js";
 
 const log = createSubsystemLogger("hooks/session-memory");
@@ -168,7 +169,49 @@ async function findPreviousSessionFile(params: {
 }
 
 /**
- * Save session context to memory when /new or /reset command is triggered
+ * Forward session content to memgine extraction endpoint.
+ * Returns true on success, false on failure.
+ */
+async function forwardToMemgine(params: {
+  convexSiteUrl: string;
+  sessionContent: string;
+  agentId: string;
+  sessionKey: string;
+  openrouterApiKey: string;
+  openaiApiKey: string;
+}): Promise<boolean> {
+  const url = `${params.convexSiteUrl}/api/extract`;
+  const turnContent = `[Agent: ${params.agentId}] [Session: ${params.sessionKey}] [Source: session-boundary]\n\nSession summary:\n${params.sessionContent}`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content: turnContent,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      turnIndex: -1, // Sentinel: session-boundary extraction
+      model: process.env.MEMGINE_EXTRACTION_MODEL || "anthropic/claude-haiku-4-5",
+      apiKey: params.openrouterApiKey,
+      openaiApiKey: params.openaiApiKey,
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    log.warn("Memgine extraction POST failed", { status: resp.status, error: errText });
+    return false;
+  }
+
+  const result = (await resp.json()) as { factsExtracted?: number };
+  log.info(`Forwarded session to memgine: ${result.factsExtracted ?? 0} facts extracted`);
+  return true;
+}
+
+/**
+ * Save session context to memory when /new or /reset command is triggered.
+ * Primary path: forward to memgine for structured fact extraction.
+ * Fallback: write markdown file when memgine is unreachable.
  */
 const saveSessionToMemory: HookHandler = async (event) => {
   // Only trigger on reset/new commands
@@ -186,14 +229,7 @@ const saveSessionToMemory: HookHandler = async (event) => {
     const workspaceDir = cfg
       ? resolveAgentWorkspaceDir(cfg, agentId)
       : path.join(resolveStateDir(process.env, os.homedir), "workspace");
-    const memoryDir = path.join(workspaceDir, "memory");
-    await fs.mkdir(memoryDir, { recursive: true });
 
-    // Get today's date for filename
-    const now = new Date(event.timestamp);
-    const dateStr = now.toISOString().split("T")[0]; // YYYY-MM-DD
-
-    // Generate descriptive slug from session using LLM
     // Prefer previousSessionEntry (old session before /new) over current (which may be empty)
     const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<
       string,
@@ -233,91 +269,127 @@ const saveSessionToMemory: HookHandler = async (event) => {
 
     const sessionFile = currentSessionFile || undefined;
 
-    // Read message count from hook config (default: 15)
+    // Read hook config
     const hookConfig = resolveHookConfig(cfg, "session-memory");
     const messageCount =
       typeof hookConfig?.messages === "number" && hookConfig.messages > 0
         ? hookConfig.messages
         : 15;
+    const archiveToMarkdown = hookConfig?.archiveToMarkdown === true;
 
-    let slug: string | null = null;
     let sessionContent: string | null = null;
 
     if (sessionFile) {
-      // Get recent conversation content, with fallback to rotated reset transcript.
       sessionContent = await getRecentSessionContentWithResetFallback(sessionFile, messageCount);
       log.debug("Session content loaded", {
         length: sessionContent?.length ?? 0,
         messageCount,
       });
+    }
 
-      // Avoid calling the model provider in unit tests; keep hooks fast and deterministic.
+    // Skip if no meaningful content to extract
+    if (!sessionContent || sessionContent.trim().length < 20) {
+      log.debug("Session content too short for extraction, skipping");
+      return;
+    }
+
+    // Resolve memgine config: use resolveHookConfig (command events carry cfg) with env fallback
+    const convexSiteUrl =
+      (hookConfig?.convexSiteUrl as string | undefined) || process.env.MEMGINE_CONVEX_SITE_URL;
+    const openrouterApiKey = process.env.OPENROUTER_API_KEY;
+    const openaiApiKey = process.env.OPENAI_API_KEY;
+    const memgineAvailable = Boolean(convexSiteUrl && openrouterApiKey && openaiApiKey);
+
+    if (!memgineAvailable) {
+      const missing = [
+        !convexSiteUrl && "MEMGINE_CONVEX_SITE_URL",
+        !openrouterApiKey && "OPENROUTER_API_KEY",
+        !openaiApiKey && "OPENAI_API_KEY",
+      ].filter(Boolean);
+      log.debug("Memgine unavailable, missing keys", { missing });
+    }
+
+    let memgineSuccess = false;
+
+    if (memgineAvailable) {
+      // Attempt memgine forwarding; fall back to markdown on failure
+      try {
+        memgineSuccess = await forwardToMemgine({
+          convexSiteUrl: convexSiteUrl!,
+          sessionContent,
+          agentId,
+          sessionKey: event.sessionKey,
+          openrouterApiKey: openrouterApiKey!,
+          openaiApiKey: openaiApiKey!,
+        });
+      } catch (err) {
+        log.warn("Memgine forwarding threw", { error: String(err) });
+      }
+    }
+
+    // Write markdown if: archiveToMarkdown is on, OR memgine forwarding failed (safety net)
+    const shouldWriteMarkdown = archiveToMarkdown || !memgineSuccess;
+
+    if (shouldWriteMarkdown) {
+      if (!memgineSuccess && !archiveToMarkdown) {
+        log.warn("Memgine unavailable or failed — falling back to markdown archive");
+      }
+
+      const memoryDir = path.join(workspaceDir, "memory");
+      await fs.mkdir(memoryDir, { recursive: true });
+
+      const now = new Date(event.timestamp);
+      const dateStr = now.toISOString().split("T")[0];
+
+      // Generate slug: only call LLM if we're actively archiving to markdown
+      let slug: string | null = null;
       const isTestEnv =
         process.env.OPENCLAW_TEST_FAST === "1" ||
         process.env.VITEST === "true" ||
         process.env.VITEST === "1" ||
         process.env.NODE_ENV === "test";
-      const allowLlmSlug = !isTestEnv && hookConfig?.llmSlug !== false;
+      const allowLlmSlug = !isTestEnv && hookConfig?.llmSlug !== false && archiveToMarkdown;
 
       if (sessionContent && cfg && allowLlmSlug) {
-        log.debug("Calling generateSlugViaLLM...");
-        // Use LLM to generate a descriptive slug
         slug = await generateSlugViaLLM({ sessionContent, cfg });
-        log.debug("Generated slug", { slug });
       }
+
+      if (!slug) {
+        const timeSlug = now.toISOString().split("T")[1].split(".")[0].replace(/:/g, "");
+        slug = timeSlug.slice(0, 4);
+      }
+
+      const filename = `${dateStr}-${slug}.md`;
+      const memoryFilePath = path.join(memoryDir, filename);
+      const timeStr = now.toISOString().split("T")[1].split(".")[0];
+      const sessionId = (sessionEntry.sessionId as string) || "unknown";
+      const source = (context.commandSource as string) || "unknown";
+
+      const entryParts = [
+        `# Session: ${dateStr} ${timeStr} UTC`,
+        "",
+        `- **Session Key**: ${event.sessionKey}`,
+        `- **Session ID**: ${sessionId}`,
+        `- **Source**: ${source}`,
+        "",
+      ];
+
+      if (sessionContent) {
+        entryParts.push("## Conversation Summary", "", sessionContent, "");
+      }
+
+      const entry = entryParts.join("\n");
+
+      await writeFileWithinRoot({
+        rootDir: memoryDir,
+        relativePath: filename,
+        data: entry,
+        encoding: "utf-8",
+      });
+
+      const relPath = memoryFilePath.replace(os.homedir(), "~");
+      log.info(`Session context saved to ${relPath}`);
     }
-
-    // If no slug, use timestamp
-    if (!slug) {
-      const timeSlug = now.toISOString().split("T")[1].split(".")[0].replace(/:/g, "");
-      slug = timeSlug.slice(0, 4); // HHMM
-      log.debug("Using fallback timestamp slug", { slug });
-    }
-
-    // Create filename with date and slug
-    const filename = `${dateStr}-${slug}.md`;
-    const memoryFilePath = path.join(memoryDir, filename);
-    log.debug("Memory file path resolved", {
-      filename,
-      path: memoryFilePath.replace(os.homedir(), "~"),
-    });
-
-    // Format time as HH:MM:SS UTC
-    const timeStr = now.toISOString().split("T")[1].split(".")[0];
-
-    // Extract context details
-    const sessionId = (sessionEntry.sessionId as string) || "unknown";
-    const source = (context.commandSource as string) || "unknown";
-
-    // Build Markdown entry
-    const entryParts = [
-      `# Session: ${dateStr} ${timeStr} UTC`,
-      "",
-      `- **Session Key**: ${event.sessionKey}`,
-      `- **Session ID**: ${sessionId}`,
-      `- **Source**: ${source}`,
-      "",
-    ];
-
-    // Include conversation content if available
-    if (sessionContent) {
-      entryParts.push("## Conversation Summary", "", sessionContent, "");
-    }
-
-    const entry = entryParts.join("\n");
-
-    // Write under memory root with alias-safe file validation.
-    await writeFileWithinRoot({
-      rootDir: memoryDir,
-      relativePath: filename,
-      data: entry,
-      encoding: "utf-8",
-    });
-    log.debug("Memory file written successfully");
-
-    // Log completion (but don't send user-visible confirmation - it's internal housekeeping)
-    const relPath = memoryFilePath.replace(os.homedir(), "~");
-    log.info(`Session context saved to ${relPath}`);
   } catch (err) {
     if (err instanceof Error) {
       log.error("Failed to save session memory", {
