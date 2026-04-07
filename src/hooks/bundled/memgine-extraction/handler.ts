@@ -145,7 +145,7 @@ async function triggerExtraction(params: {
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`Extraction API error: ${resp.status} ${errText}`);
+    throw new Error(`Extraction API error: ${resp.status} ${errText} (url: ${url})`);
   }
 
   const result = await resp.json();

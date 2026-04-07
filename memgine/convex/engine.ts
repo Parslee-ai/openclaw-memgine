@@ -64,8 +64,18 @@ export const assembleContext = action({
       ...args.budgets,
     };
 
-    // Step 1: Get all active facts
-    const allFacts = (await ctx.runQuery(api.facts.listActive, {})) as FactRecord[];
+    // Step 1: Get active facts per-layer to stay under Convex's 8192 array limit.
+    // Subagents/cron only get Layer 1 + Layer 2.
+    const layersToFetch =
+      args.sessionType === "subagent" || args.sessionType === "cron" ? [1, 2] : [1, 2, 3, 4];
+
+    const layerResults = await Promise.all(
+      layersToFetch.map(
+        (layer) => ctx.runQuery(api.facts.listActive, { layer }) as Promise<FactRecord[]>,
+      ),
+    );
+
+    const allFacts: FactRecord[] = layerResults.flat();
 
     if (allFacts.length === 0) {
       return { context: "", stats: { totalFacts: 0, includedFacts: 0, droppedFacts: 0 } };
@@ -79,10 +89,6 @@ export const assembleContext = action({
       }
       // Scope: hypothetical/draft excluded unless explicitly queried
       if (f.scope === "hypothetical" || f.scope === "draft") {
-        return false;
-      }
-      // Subagents/cron get restricted access (Layer 1 + Layer 2 only)
-      if ((args.sessionType === "subagent" || args.sessionType === "cron") && f.layer > 2) {
         return false;
       }
       return true;

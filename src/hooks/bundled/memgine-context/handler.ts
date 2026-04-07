@@ -5,9 +5,9 @@
  * as a virtual bootstrap file during agent:bootstrap.
  */
 
+import type { WorkspaceBootstrapFile } from "../../../agents/workspace.js";
 import { resolveHookConfig } from "../../config.js";
 import { isAgentBootstrapEvent, type InternalHookHandler } from "../../internal-hooks.js";
-import type { WorkspaceBootstrapFile } from "../../../agents/workspace.js";
 
 const HOOK_KEY = "memgine-context";
 
@@ -29,13 +29,19 @@ interface MemgineConfig {
  * Examples: "agent:dev:main" → "main", "agent:dev:subagent:xxx" → "subagent", "agent:dev:cron:xxx" → "cron"
  */
 function resolveSessionType(sessionKey?: string): string {
-  if (!sessionKey) {return "main";}
+  if (!sessionKey) {
+    return "main";
+  }
   const parts = sessionKey.split(":");
   // Pattern: agent:<id>:<type>[:<suffix>]
   if (parts.length >= 3) {
     const type = parts[2];
-    if (type === "subagent" || type === "cron") {return type;}
-    if (type === "main") {return "main";}
+    if (type === "subagent" || type === "cron") {
+      return type;
+    }
+    if (type === "main") {
+      return "main";
+    }
   }
   return "main";
 }
@@ -45,8 +51,12 @@ function resolveSessionType(sessionKey?: string): string {
  * Example: "agent:dev:main" → "dev"
  */
 function resolveAgentId(sessionKey?: string, agentId?: string): string {
-  if (agentId) {return agentId;}
-  if (!sessionKey) {return "unknown";}
+  if (agentId) {
+    return agentId;
+  }
+  if (!sessionKey) {
+    return "unknown";
+  }
   const parts = sessionKey.split(":");
   return parts.length >= 2 ? parts[1] : "unknown";
 }
@@ -54,11 +64,7 @@ function resolveAgentId(sessionKey?: string, agentId?: string): string {
 /**
  * Generate embedding for a query string using OpenAI API.
  */
-async function generateEmbedding(
-  text: string,
-  model: string,
-  apiKey: string
-): Promise<number[]> {
+async function generateEmbedding(text: string, model: string, apiKey: string): Promise<number[]> {
   const resp = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: {
@@ -89,8 +95,8 @@ async function callMemgineAssemble(
     agentId: string;
     sessionType: string;
     budgets?: MemgineConfig["budgets"];
-  }
-): Promise<{ context: string; stats: Record<string, unknown> }> {
+  },
+): Promise<{ context: string; stats: { includedFacts?: number; droppedFacts?: number } }> {
   // Convex HTTP actions endpoint
   const url = convexUrl.replace(/\/$/, "");
   const actionUrl = `${url}/api/action`;
@@ -109,7 +115,23 @@ async function callMemgineAssemble(
     throw new Error(`Memgine assembleContext error: ${resp.status} ${await resp.text()}`);
   }
 
-  const result = (await resp.json()) as unknown as { value: { context: string; stats: Record<string, unknown> } };
+  const result = (await resp.json()) as unknown as {
+    status?: string;
+    errorMessage?: string;
+    value?: { context: string; stats: { includedFacts?: number; droppedFacts?: number } } | null;
+  };
+
+  // Convex returns HTTP 200 with { status: "error" } for action failures
+  if (result.status === "error") {
+    throw new Error(
+      `Memgine assembleContext action error: ${result.errorMessage ?? "unknown error"}`,
+    );
+  }
+
+  if (!result.value) {
+    throw new Error("Memgine assembleContext returned empty value");
+  }
+
   return result.value;
 }
 
@@ -165,23 +187,22 @@ const memgineContextHook: InternalHookHandler = async (event) => {
     // Keep identity files (SOUL.md, AGENTS.md, USER.md, TOOLS.md) — those are still
     // useful for onboarding and will eventually be migrated to Layer 1 facts
     const replacedFiles = new Set(["MEMORY.md", "WORKING.md"]);
-    const filteredFiles = context.bootstrapFiles.filter(
-      (f) => !replacedFiles.has(f.name)
-    );
+    const filteredFiles = context.bootstrapFiles.filter((f) => !replacedFiles.has(f.name));
 
     // Inject Memgine context as a virtual bootstrap file
-    const memgineFile = {
-      name: "MEMORY.md" as any, // Takes MEMORY.md's slot in context
+    const memgineFile: WorkspaceBootstrapFile = {
+      name: "MEMORY.md" as WorkspaceBootstrapFile["name"],
       path: "[memgine:virtual]",
       content: `# Memgine Context\n\n${result.context}`,
       missing: false,
-    } satisfies WorkspaceBootstrapFile;
+    };
 
     context.bootstrapFiles = [...filteredFiles, memgineFile];
 
+    const included = result.stats?.includedFacts ?? "?";
+    const dropped = result.stats?.droppedFacts ?? 0;
     console.log(
-      `[memgine-context] Injected ${(result.stats as Record<string, unknown>)?.includedFacts ?? "?"} facts ` +
-        `(${(result.stats as Record<string, unknown>)?.droppedFacts ?? 0} dropped) for agent=${agentId} session=${sessionType}`
+      `[memgine-context] Injected ${String(included)} facts (${String(dropped)} dropped) for agent=${agentId} session=${sessionType}`,
     );
   } catch (err) {
     console.error(`[memgine-context] Failed to assemble context: ${String(err)}`);
