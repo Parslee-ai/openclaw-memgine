@@ -1,6 +1,6 @@
 import { v } from "convex/values";
-import { mutation, action } from "./_generated/server";
 import { api } from "./_generated/api";
+import { mutation, query, action } from "./_generated/server";
 
 /** Store an embedding for a fact. */
 export const store = mutation({
@@ -24,6 +24,17 @@ export const store = mutation({
   },
 });
 
+/** Fetch fact_embeddings documents by their IDs (used internally after vector search). */
+export const getByIds = query({
+  args: {
+    ids: v.array(v.id("fact_embeddings")),
+  },
+  handler: async (ctx, args) => {
+    const docs = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
+    return docs;
+  },
+});
+
 /** Vector search: find facts most relevant to a query embedding. */
 export const searchByVector = action({
   args: {
@@ -35,10 +46,23 @@ export const searchByVector = action({
       vector: args.queryEmbedding,
       limit: args.limit ?? 64,
     });
-    // Return factIds with scores
-    return results.map((r) => ({
-      factId: r.factId,
-      score: r._score,
-    }));
+
+    if (results.length === 0) {
+      return [];
+    }
+
+    // vectorSearch returns { _id, _score } — fetch full documents to get factId
+    const docs = await ctx.runQuery(api.embeddings.getByIds, {
+      ids: results.map((r) => r._id),
+    });
+
+    // Zip factIds with scores, skipping any deleted documents
+    const scoreMap = new Map(results.map((r) => [r._id.toString(), r._score]));
+    return docs
+      .filter((d): d is NonNullable<typeof d> => d != null)
+      .map((d) => ({
+        factId: d.factId,
+        score: scoreMap.get(d._id.toString()) ?? 0,
+      }));
   },
 });
