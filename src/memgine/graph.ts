@@ -38,6 +38,8 @@ export class MemoryGraph {
   private lastConversation: number | null = null;
   // Free list for removed slots
   private freeList: number[] = [];
+  // Suppress auto-linking during snapshot restore
+  private suppressAutoLink = false;
 
   // ── Insert ─────────────────────────────────────────────────────────────────
 
@@ -67,8 +69,8 @@ export class MemoryGraph {
     const li = Math.min(Math.max(node.layer - 1, 0), 3);
     this.byLayerIdx[li].push(idx);
 
-    // Auto-link conversation nodes temporally
-    if (node.kind === MemKind.Conversation || node.kind === MemKind.ConversationSummary) {
+    // Auto-link conversation nodes temporally (suppressed during snapshot restore)
+    if (!this.suppressAutoLink && (node.kind === MemKind.Conversation || node.kind === MemKind.ConversationSummary)) {
       if (this.lastConversation !== null) {
         this.link(this.lastConversation, idx, EdgeKind.TemporalNext, 1.0);
       }
@@ -673,6 +675,16 @@ export class MemoryGraph {
       }
     }
     return result;
+  }
+
+  /** Get all edges (for persistence serialization). */
+  allEdges(): MemEdge[] {
+    return this.edges;
+  }
+
+  /** Suppress/resume auto-linking (used during snapshot restore). */
+  setAutoLink(enabled: boolean): void {
+    this.suppressAutoLink = !enabled;
   }
 
   clear(): void {
