@@ -16,17 +16,128 @@ import {
   emptyMetadata,
 } from "./types.js";
 import { type MemgineConfig, DEFAULT_CONFIG, effectiveBudget, layerTokens } from "./v2config.js";
+import {
+  saveGraphSnapshot,
+  loadGraphSnapshot,
+  appendConversation,
+  loadConversations,
+} from "./persistence.js";
+import {
+  consolidate,
+  shouldConsolidate,
+  type ConsolidationConfig,
+  type ConsolidationResult,
+  DEFAULT_CONSOLIDATION_CONFIG,
+} from "./consolidation.js";
+import { detectReflections, type ReflectionInsight } from "./compaction.js";
 
 export class MemgineEngine {
   public graph: MemoryGraph;
   public needsReview = new Set<string>();
 
   private cfg: MemgineConfig;
+  private consolidationCfg: ConsolidationConfig;
   private factIdCounts = new Map<string, number>();
 
-  constructor(config?: Partial<MemgineConfig>) {
+  /** Persistence paths (null = persistence disabled). */
+  private graphPath: string | null = null;
+  private conversationPath: string | null = null;
+
+  /** Ingestion counter for auto-snapshot triggering. */
+  private ingestionsSinceSnapshot = 0;
+
+  constructor(config?: Partial<MemgineConfig>, consolidationConfig?: Partial<ConsolidationConfig>) {
     this.cfg = { ...DEFAULT_CONFIG, ...config };
+    this.consolidationCfg = { ...DEFAULT_CONSOLIDATION_CONFIG, ...consolidationConfig };
     this.graph = new MemoryGraph();
+  }
+
+  // ── Persistence ────────────────────────────────────────────────────────────
+
+  /**
+   * Enable persistence. Call after constructor to set file paths.
+   */
+  enablePersistence(graphPath: string, conversationPath: string): void {
+    this.graphPath = graphPath;
+    this.conversationPath = conversationPath;
+  }
+
+  /**
+   * Load graph state from JSONL snapshot.
+   * Must call enablePersistence() first.
+   */
+  loadSnapshot(): void {
+    if (!this.graphPath) {return;}
+    this.graph = loadGraphSnapshot(this.graphPath);
+  }
+
+  /**
+   * Load conversations from JSONL and replay into graph.
+   * Must call enablePersistence() first.
+   */
+  loadConversationHistory(): void {
+    if (!this.conversationPath) {return;}
+    const turns = loadConversations(this.conversationPath);
+    for (const turn of turns) {
+      // Insert into graph without re-persisting to conversation store
+      this.graph.insert({
+        kind: MemKind.Conversation,
+        layer: 3,
+        key: turn.speaker,
+        value: `${turn.speaker}: ${turn.text}`,
+        scope: "global",
+        authority: "peer",
+        isConstraint: false,
+        createdAt: turn.ts,
+        contentType: "natural_language",
+        metadata: emptyMetadata(),
+      });
+    }
+  }
+
+  /**
+   * Persist current graph state to JSONL snapshot.
+   */
+  persistSnapshot(): void {
+    if (!this.graphPath) {return;}
+    saveGraphSnapshot(this.graph, this.graphPath);
+    this.ingestionsSinceSnapshot = 0;
+  }
+
+  /**
+   * Run consolidation pass (prune, GC, compact, reflect, persist).
+   */
+  consolidate(): ConsolidationResult | null {
+    if (!this.graphPath || !this.conversationPath) {return null;}
+    const result = consolidate(
+      this,
+      this.graphPath,
+      this.conversationPath,
+      this.consolidationCfg,
+    );
+    this.ingestionsSinceSnapshot = 0;
+    return result;
+  }
+
+  /**
+   * Check if consolidation should be triggered.
+   */
+  shouldConsolidate(): boolean {
+    if (!this.conversationPath) {return false;}
+    return shouldConsolidate(
+      this.conversationPath,
+      this.ingestionsSinceSnapshot,
+      this.consolidationCfg,
+    );
+  }
+
+  /**
+   * Detect self-reflection insights from current conversation history.
+   */
+  detectReflections(): ReflectionInsight[] {
+    if (!this.conversationPath) {return [];}
+    const turns = loadConversations(this.conversationPath);
+    return detectReflections(turns);
   }
 
   // ── Ingest Methods ─────────────────────────────────────────────────────────
@@ -66,6 +177,8 @@ export class MemgineEngine {
     const count = (this.factIdCounts.get(factId) ?? 0) + 1;
     this.factIdCounts.set(factId, count);
     const effectiveId = count > 1 ? `${factId}-${count}` : factId;
+
+    this.ingestionsSinceSnapshot++;
 
     const nix = this.graph.insert({
       kind: MemKind.Fact,
@@ -128,6 +241,13 @@ export class MemgineEngine {
   }
 
   ingestConversation(speaker: string, text: string, ts: number): number {
+    // Write-through to conversation store
+    if (this.conversationPath) {
+      appendConversation(this.conversationPath, speaker, text, ts);
+    }
+
+    this.ingestionsSinceSnapshot++;
+
     return this.graph.insert({
       kind: MemKind.Conversation,
       layer: 3,
