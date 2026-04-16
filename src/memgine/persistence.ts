@@ -68,7 +68,9 @@ function memKindToString(kind: MemKind): string {
 
 function stringToMemKind(s: string): MemKind {
   const val = (MemKind as Record<string, unknown>)[s];
-  if (typeof val === "number") {return val as MemKind;}
+  if (typeof val === "number") {
+    return val as MemKind;
+  }
   throw new Error(`Unknown MemKind: ${s}`);
 }
 
@@ -78,7 +80,9 @@ function edgeKindToString(kind: EdgeKind): string {
 
 function stringToEdgeKind(s: string): EdgeKind {
   const val = (EdgeKind as Record<string, unknown>)[s];
-  if (typeof val === "number") {return val as EdgeKind;}
+  if (typeof val === "number") {
+    return val as EdgeKind;
+  }
   throw new Error(`Unknown EdgeKind: ${s}`);
 }
 
@@ -184,6 +188,9 @@ export function saveGraphSnapshot(graph: MemoryGraph, filePath: string): void {
  * On parse error for a line, skips it (graceful degradation).
  */
 export function loadGraphSnapshot(filePath: string): MemoryGraph {
+  // R-4: Clean up stale .tmp files left by interrupted saves
+  cleanStaleTmpFiles(filePath);
+
   if (!fs.existsSync(filePath)) {
     return new MemoryGraph();
   }
@@ -308,7 +315,39 @@ export function rewriteConversations(
  * Count lines in conversation store without loading full content.
  */
 export function conversationLineCount(filePath: string): number {
-  if (!fs.existsSync(filePath)) {return 0;}
+  if (!fs.existsSync(filePath)) {
+    return 0;
+  }
   const content = fs.readFileSync(filePath, "utf8");
   return content.split("\n").filter((l) => l.trim().length > 0).length;
+}
+
+// ── Stale .tmp Cleanup (R-4) ──────────────────────────────────────────────────
+
+/** Max age for .tmp files before cleanup (5 minutes). */
+const STALE_TMP_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Remove stale .tmp files that may have been left by interrupted atomic saves.
+ * Only removes .tmp files older than STALE_TMP_MAX_AGE_MS to avoid racing
+ * with an in-progress write.
+ */
+export function cleanStaleTmpFiles(filePath: string): number {
+  const tmpPath = filePath + ".tmp";
+  let cleaned = 0;
+
+  try {
+    if (fs.existsSync(tmpPath)) {
+      const stat = fs.statSync(tmpPath);
+      const age = Date.now() - stat.mtimeMs;
+      if (age > STALE_TMP_MAX_AGE_MS) {
+        fs.unlinkSync(tmpPath);
+        cleaned++;
+      }
+    }
+  } catch {
+    // Ignore cleanup failures — non-critical
+  }
+
+  return cleaned;
 }
