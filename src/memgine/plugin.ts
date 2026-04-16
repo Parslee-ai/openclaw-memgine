@@ -14,6 +14,7 @@
  * - RA-3: Singleton engine map (module-level Map<string, MemgineEngine>)
  */
 
+import * as os from "os";
 import * as path from "path";
 import type {
   OpenClawPluginDefinition,
@@ -31,7 +32,7 @@ import type {
 import { MemgineEngine } from "./engine.js";
 import { validateMemgineConfig, type MemginePluginConfig } from "./plugin-config.js";
 
-// ── Singleton Engine Map (RA-3) ────────────────────────────────────────────────
+// ── Singleton Engine Map ───────────────────────────────────────────────────────
 
 /** Module-level engine map keyed by workspaceDir. */
 const engines = new Map<string, MemgineEngine>();
@@ -56,12 +57,10 @@ export function getOrCreateEngine(
     return engine;
   }
 
-  // Validate config
   const { config } = validateMemgineConfig(pluginConfig);
 
   engine = new MemgineEngine(config);
 
-  // Set persistence paths
   const memgineDir = path.join(workspaceDir, ".memgine");
   const graphPath = path.join(memgineDir, "graph.jsonl");
   const conversationPath = path.join(memgineDir, "conversations.jsonl");
@@ -85,7 +84,6 @@ export function evictStaleEngines(): number {
     if (now - lastAccess > ENGINE_TTL_MS) {
       const engine = engines.get(dir);
       if (engine) {
-        // Persist before eviction
         try {
           engine.persistSnapshot();
         } catch {
@@ -112,6 +110,78 @@ export function engineCacheSize(): number {
   return engines.size;
 }
 
+// ── Routing Maps (RA-2) ────────────────────────────────────────────────────────
+
+/** Session routing TTL: 2 hours. */
+const SESSION_ROUTING_TTL_MS = 2 * 60 * 60 * 1000;
+
+/** sessionId → workspaceDir. Populated on session_start and before_prompt_build. */
+const sessionToWorkspace = new Map<string, string>();
+
+/** Tracks last access time for session routing entries. */
+const sessionLastAccess = new Map<string, number>();
+
+/** channelId → workspaceDir. Populated on before_prompt_build. */
+const channelToWorkspace = new Map<string, string>();
+
+function evictExpiredSessionEntries(): void {
+  const now = Date.now();
+  for (const [sessionId, lastAccess] of sessionLastAccess) {
+    if (now - lastAccess > SESSION_ROUTING_TTL_MS) {
+      sessionToWorkspace.delete(sessionId);
+      sessionLastAccess.delete(sessionId);
+    }
+  }
+}
+
+export function getSessionWorkspace(sessionId: string): string | undefined {
+  evictExpiredSessionEntries();
+  const ws = sessionToWorkspace.get(sessionId);
+  if (ws !== undefined) {
+    sessionLastAccess.set(sessionId, Date.now());
+  }
+  return ws;
+}
+
+export function getChannelWorkspace(channelId: string): string | undefined {
+  return channelToWorkspace.get(channelId);
+}
+
+export function sessionMapSize(): number {
+  return sessionToWorkspace.size;
+}
+
+export function channelMapSize(): number {
+  return channelToWorkspace.size;
+}
+
+export function clearRoutingMaps(): void {
+  sessionToWorkspace.clear();
+  sessionLastAccess.clear();
+  channelToWorkspace.clear();
+}
+
+// ── Workspace Resolution (RA-1) ────────────────────────────────────────────────
+
+/**
+ * Resolve workspace directory from hook context.
+ * Uses workspaceDir when available; falls back to agentId-based convention.
+ */
+export function resolveWorkspaceDir(ctx: {
+  workspaceDir?: string;
+  agentId?: string;
+}): string | undefined {
+  if (ctx.workspaceDir) {return ctx.workspaceDir;}
+  if (ctx.agentId) {
+    // Guard against path traversal in agentId
+    if (ctx.agentId.includes("..") || ctx.agentId.includes("/") || ctx.agentId.includes("\\")) {
+      return undefined;
+    }
+    return path.join(os.homedir(), ".openclaw", `workspace-${ctx.agentId}`);
+  }
+  return undefined;
+}
+
 // ── Plugin Definition ──────────────────────────────────────────────────────────
 
 const memginePlugin: OpenClawPluginDefinition = {
@@ -123,9 +193,8 @@ const memginePlugin: OpenClawPluginDefinition = {
 
   register(api: OpenClawPluginApi): void {
     const pluginConfig = api.pluginConfig as Partial<MemginePluginConfig> | undefined;
-    const { version, warnings } = validateMemgineConfig(pluginConfig);
+    const { version, warnings, contextWindow } = validateMemgineConfig(pluginConfig);
 
-    // Log config warnings
     for (const w of warnings) {
       api.logger.warn(`[memgine-v2] config: ${w}`);
     }
@@ -145,6 +214,10 @@ const memginePlugin: OpenClawPluginDefinition = {
       if (!workspaceDir) {
         return;
       }
+
+      // RA-2: Register session → workspace mapping
+      sessionToWorkspace.set(ctx.sessionId, workspaceDir);
+      sessionLastAccess.set(ctx.sessionId, Date.now());
 
       const engine = getOrCreateEngine(workspaceDir, pluginConfig);
 
@@ -172,15 +245,22 @@ const memginePlugin: OpenClawPluginDefinition = {
           return;
         }
 
+        // RA-2: Keep routing maps current (before_prompt_build has channelId + sessionId)
+        if (ctx.sessionId) {
+          sessionToWorkspace.set(ctx.sessionId, workspaceDir);
+          sessionLastAccess.set(ctx.sessionId, Date.now());
+        }
+        if (ctx.channelId) {
+          channelToWorkspace.set(ctx.channelId, workspaceDir);
+        }
+
         const engine = engines.get(workspaceDir);
         if (!engine) {
           return;
         }
 
         try {
-          // Use the user's prompt as the retrieval query
-          // Default context window of 128000 tokens (typical for modern models)
-          const contextWindow = 128000;
+          // RA-3: Use validated contextWindow from config instead of hardcoded value
           const context = engine.buildContext(event.prompt, contextWindow);
 
           if (context && context.trim().length > 0) {
@@ -198,17 +278,23 @@ const memginePlugin: OpenClawPluginDefinition = {
 
     api.on(
       "message_received",
-      (event: PluginHookMessageReceivedEvent, _ctx: PluginHookMessageContext) => {
-        // We need a workspace dir — try to get it from the engine map
-        // message_received context doesn't carry agentId/workspaceDir directly,
-        // so we operate on the most recently accessed engine
-        const entry = getMostRecentEngine();
-        if (!entry) {
+      (event: PluginHookMessageReceivedEvent, ctx: PluginHookMessageContext) => {
+        // RA-2: Route via channelId → workspaceDir; no getMostRecentEngine fallback
+        const workspaceDir = channelToWorkspace.get(ctx.channelId);
+        if (!workspaceDir) {
+          api.logger.warn(
+            `[memgine-v2] message_received: no workspace for channelId ${ctx.channelId}; skipping`,
+          );
+          return;
+        }
+
+        const engine = engines.get(workspaceDir);
+        if (!engine) {
           return;
         }
 
         try {
-          entry.engine.ingestConversation("user", event.content, event.timestamp ?? Date.now());
+          engine.ingestConversation("user", event.content, event.timestamp ?? Date.now());
         } catch (err) {
           api.logger.error(`[memgine-v2] message_received: ingestion failed: ${String(err)}`);
         }
@@ -217,19 +303,27 @@ const memginePlugin: OpenClawPluginDefinition = {
 
     // ── message_sent (assistant message) ────────────────────────────────────
 
-    api.on("message_sent", (event: PluginHookMessageSentEvent, _ctx: PluginHookMessageContext) => {
+    api.on("message_sent", (event: PluginHookMessageSentEvent, ctx: PluginHookMessageContext) => {
       if (!event.success) {
-        return;
-      } // Don't ingest failed sends
-
-      const entry = getMostRecentEngine();
-      if (!entry) {
         return;
       }
 
-      // Fire-and-forget: don't block on ingestion
+      // RA-2: Route via channelId → workspaceDir; no getMostRecentEngine fallback
+      const workspaceDir = channelToWorkspace.get(ctx.channelId);
+      if (!workspaceDir) {
+        api.logger.warn(
+          `[memgine-v2] message_sent: no workspace for channelId ${ctx.channelId}; skipping`,
+        );
+        return;
+      }
+
+      const engine = engines.get(workspaceDir);
+      if (!engine) {
+        return;
+      }
+
       try {
-        entry.engine.ingestConversation("assistant", event.content, Date.now());
+        engine.ingestConversation("assistant", event.content, Date.now());
       } catch (err) {
         api.logger.error(`[memgine-v2] message_sent: ingestion failed: ${String(err)}`);
       }
@@ -245,19 +339,21 @@ const memginePlugin: OpenClawPluginDefinition = {
           return;
         }
 
+        // RA-2: Clean up session routing entry
+        sessionToWorkspace.delete(ctx.sessionId);
+        sessionLastAccess.delete(ctx.sessionId);
+
         const engine = engines.get(workspaceDir);
         if (!engine) {
           return;
         }
 
         try {
-          // Always persist snapshot on session end
           engine.persistSnapshot();
           api.logger.info(
             `[memgine-v2] session_end: persisted graph (${engine.graph.nodeCount()} nodes)`,
           );
 
-          // RA-2: Consolidation check — no heartbeat-specific logic
           if (engine.shouldConsolidate()) {
             api.logger.info(
               "[memgine-v2] session_end: consolidation threshold met, running consolidation",
@@ -267,7 +363,6 @@ const memginePlugin: OpenClawPluginDefinition = {
               api.logger.info(
                 `[memgine-v2] session_end: consolidation complete — pruned=${result.pruned}, gc=${result.gcRemoved}, compaction=${result.compaction ? "yes" : "no"}`,
               );
-              // Persist again after consolidation
               engine.persistSnapshot();
             }
           }
@@ -277,53 +372,10 @@ const memginePlugin: OpenClawPluginDefinition = {
           );
         }
 
-        // Evict stale engines to keep memory bounded
         evictStaleEngines();
       },
     );
   },
 };
-
-// ── Utilities ──────────────────────────────────────────────────────────────────
-
-/**
- * Resolve workspace directory from hook context.
- * Tries workspaceDir from context, falls back to agentId-based resolution.
- */
-function resolveWorkspaceDir(ctx: {
-  workspaceDir?: string;
-  agentId?: string;
-  sessionKey?: string;
-}): string | undefined {
-  if (ctx.workspaceDir) {
-    return ctx.workspaceDir;
-  }
-  // Can't resolve without workspaceDir — message hooks handle this separately
-  return undefined;
-}
-
-/**
- * Get the most recently accessed engine (for hooks without workspace context).
- */
-function getMostRecentEngine(): { dir: string; engine: MemgineEngine } | undefined {
-  let bestDir: string | undefined;
-  let bestTime = 0;
-
-  for (const [dir, time] of engineLastAccess) {
-    if (time > bestTime) {
-      bestTime = time;
-      bestDir = dir;
-    }
-  }
-
-  if (bestDir) {
-    const engine = engines.get(bestDir);
-    if (engine) {
-      return { dir: bestDir, engine };
-    }
-  }
-
-  return undefined;
-}
 
 export default memginePlugin;
