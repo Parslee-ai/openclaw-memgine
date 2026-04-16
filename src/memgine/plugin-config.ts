@@ -23,17 +23,23 @@ export interface MemginePluginConfig {
   environmentMax?: number;
   /** Response reservation tokens. Must be >= 0. */
   responseReservation?: number;
+  /** Model context window size for dynamic budget calculation. Clamped to minimum 2000. Default: 128000. */
+  contextWindow?: number;
 }
 
 export interface ConfigValidationResult {
   config: MemgineConfig;
   version: 1 | 2;
   warnings: string[];
+  /** Validated context window size for dynamic budget calculation. */
+  contextWindow: number;
 }
+
+const DEFAULT_CONTEXT_WINDOW = 128000;
 
 /**
  * Validate and normalize memgine plugin config.
- * Returns a validated MemgineConfig + version flag + any warnings.
+ * Returns a validated MemgineConfig + version flag + any warnings + contextWindow.
  */
 export function validateMemgineConfig(raw?: Partial<MemginePluginConfig>): ConfigValidationResult {
   const warnings: string[] = [];
@@ -134,5 +140,22 @@ export function validateMemgineConfig(raw?: Partial<MemginePluginConfig>): Confi
     config.layer4Fraction = l4;
   }
 
-  return { config, version, warnings };
+  // contextWindow (RA-3): reject negatives, clamp minimum to 2000
+  let contextWindow = DEFAULT_CONTEXT_WINDOW;
+  if (input.contextWindow !== undefined) {
+    if (input.contextWindow < 0) {
+      warnings.push(
+        `contextWindow ${input.contextWindow} is negative; using default ${DEFAULT_CONTEXT_WINDOW}`,
+      );
+    } else if (input.contextWindow < 2000) {
+      warnings.push(
+        `contextWindow ${input.contextWindow} is below minimum 2000; clamping to 2000`,
+      );
+      contextWindow = 2000;
+    } else {
+      contextWindow = input.contextWindow;
+    }
+  }
+
+  return { config, version, warnings, contextWindow };
 }
